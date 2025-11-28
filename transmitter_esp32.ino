@@ -99,6 +99,17 @@ typedef struct
 
 TelemetryData telemetry;
 
+// ==================== CONTROL DATA STRUCTURE (Received from Receiver) ====================
+typedef struct
+{
+    bool manualMode;      // true = manual control, false = auto stabilization
+    float pitchCommand;   // -1.0 to +1.0 (joystick Y axis normalized)
+    float rollCommand;    // -1.0 to +1.0 (joystick X axis normalized)
+    uint32_t timestamp;   // For connection monitoring
+} ControlData;
+
+ControlData receivedControl;
+
 // ==================== ESP-NOW CONFIGURATION ====================
 // Receiver ESP32's MAC Address: FC:E8:C0:E0:D2:F4
 // Format: {0xXX, 0xXX, 0xXX, 0xXX, 0xXX, 0xXX}
@@ -144,6 +155,13 @@ unsigned long lastTelemetrySend = 0;
 const unsigned long TELEMETRY_INTERVAL = 20; // Send every 20ms (50Hz)
 const unsigned long LOOP_INTERVAL = 10;      // Main loop at 100Hz (10ms)
 
+// ==================== MANUAL MODE VARIABLES ====================
+volatile bool manualModeActive = false;
+volatile float manualPitchCmd = 0.0;
+volatile float manualRollCmd = 0.0;
+unsigned long lastManualCommandTime = 0;
+const unsigned long MANUAL_TIMEOUT = 500; // Resume auto if no command for 500ms
+
 // ==================== SERVO OBJECTS ====================
 Servo right_elevon;
 Servo left_elevon;
@@ -154,6 +172,27 @@ void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
     // Optional: Monitor send status
     // Serial.print("Send Status: ");
     // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+// Receive callback - for control data from receiver
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len)
+{
+    if (len == sizeof(ControlData))
+    {
+        memcpy(&receivedControl, incomingData, sizeof(receivedControl));
+        
+        // Update manual mode state
+        manualModeActive = receivedControl.manualMode;
+        manualPitchCmd = receivedControl.pitchCommand;
+        manualRollCmd = receivedControl.rollCommand;
+        lastManualCommandTime = millis();
+        
+        // Debug output
+        if (manualModeActive)
+        {
+            Serial.printf("MANUAL MODE: Pitch=%.2f Roll=%.2f\n", manualPitchCmd, manualRollCmd);
+        }
+    }
 }
 
 // ==================== MPU6050 CALIBRATION ====================
@@ -313,6 +352,9 @@ void setup()
     // Register send callback
     esp_now_register_send_cb(OnDataSent);
 
+    // Register receive callback (for manual mode control)
+    esp_now_register_recv_cb(OnDataRecv);
+
     // Register receiver peer
     memcpy(peerInfo.peer_addr, receiverAddress, 6);
     peerInfo.channel = 0;
@@ -419,18 +461,52 @@ void loop()
         pitch = constrain(pitch, -max_tilt_angle, max_tilt_angle);
         roll = constrain(roll, -max_tilt_angle, max_tilt_angle);
 
-        // Compute PID for pitch and roll
-        computePID_Pitch();
-        computePID_Roll();
+        // ========== CHECK MANUAL MODE TIMEOUT ==========
+        if (manualModeActive && (millis() - lastManualCommandTime > MANUAL_TIMEOUT))
+        {
+            Serial.println("⚠ Manual mode timeout - resuming auto stabilization");
+            manualModeActive = false;
+            manualPitchCmd = 0.0;
+            manualRollCmd = 0.0;
+        }
 
-        // ========== ELEVON MIXING ==========
-        // PITCH REVERSED: Servos mounted sideways, need negative pitch
-        // Right Elevon = -Pitch + Roll (negative pitch for nose up, positive roll = right down)
-        // Left Elevon  = -Pitch - Roll (negative pitch for nose up, positive roll = left up)
+        // ========== MANUAL MODE OR AUTO STABILIZATION ==========
+        if (manualModeActive)
+        {
+            // ===== MANUAL MODE: Direct joystick control (PID disabled) =====
+            
+            // Convert joystick commands (-1.0 to +1.0) to servo angles
+            // Pitch: negative command = nose up (elevons deflect together)
+            // Roll: positive command = roll right (elevons deflect opposite)
+            
+            float manual_pitch_deflection = -manualPitchCmd * ELEVON_RANGE; // Invert for correct direction
+            float manual_roll_deflection = manualRollCmd * ELEVON_RANGE;
+            
+            // Apply elevon mixing
+            right_elevon_angle = ELEVON_CENTER + manual_pitch_deflection + manual_roll_deflection;
+            left_elevon_angle = ELEVON_CENTER + manual_pitch_deflection - manual_roll_deflection;
+            
+            // Reset PID integrators when in manual mode
+            integral_pitch = 0;
+            integral_roll = 0;
+        }
+        else
+        {
+            // ===== AUTO STABILIZATION MODE: PID control =====
+            
+            // Compute PID for pitch and roll
+            computePID_Pitch();
+            computePID_Roll();
 
-        // DIAGNOSTIC: Temporarily test PITCH ONLY (no roll mixing)
-        right_elevon_angle = ELEVON_CENTER - pitch_PID; // + roll_PID;
-        left_elevon_angle = ELEVON_CENTER - pitch_PID;  // - roll_PID;
+            // ELEVON MIXING with PID
+            // PITCH REVERSED: Servos mounted sideways, need negative pitch
+            // Right Elevon = -Pitch + Roll (negative pitch for nose up, positive roll = right down)
+            // Left Elevon  = -Pitch - Roll (negative pitch for nose up, positive roll = left up)
+
+            // DIAGNOSTIC: Temporarily test PITCH ONLY (no roll mixing)
+            right_elevon_angle = ELEVON_CENTER - pitch_PID; // + roll_PID;
+            left_elevon_angle = ELEVON_CENTER - pitch_PID;  // - roll_PID;
+        }
 
         // Constrain to safe range (30° to 150°, ±60° from center)
         right_elevon_angle = constrain(right_elevon_angle, ELEVON_MIN, ELEVON_MAX);
@@ -461,8 +537,16 @@ void loop()
             // Print status to serial monitor
             if (result == ESP_OK)
             {
-                Serial.printf("TX→ Pitch:%.1f° Roll:%.1f° R-Elevon:%d° L-Elevon:%d° GyroPitch:%.1f GyroRoll:%.1f\n",
-                              pitch, roll, (int)right_elevon_angle, (int)left_elevon_angle, GyroY, GyroX);
+                if (manualModeActive)
+                {
+                    Serial.printf("MANUAL→ PitchCmd:%.2f RollCmd:%.2f R-Elevon:%d° L-Elevon:%d°\n",
+                                  manualPitchCmd, manualRollCmd, (int)right_elevon_angle, (int)left_elevon_angle);
+                }
+                else
+                {
+                    Serial.printf("AUTO→ Pitch:%.1f° Roll:%.1f° R-Elevon:%d° L-Elevon:%d° GyroPitch:%.1f GyroRoll:%.1f\n",
+                                  pitch, roll, (int)right_elevon_angle, (int)left_elevon_angle, GyroY, GyroX);
+                }
             }
             else
             {

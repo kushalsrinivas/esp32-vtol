@@ -81,8 +81,24 @@ typedef struct
 
 TelemetryData receivedData;
 
+// ==================== CONTROL DATA STRUCTURE (Receiver → Transmitter) ====================
+typedef struct
+{
+    bool manualMode;    // true = manual control, false = auto stabilization
+    float pitchCommand; // -1.0 to +1.0 (joystick Y axis normalized)
+    float rollCommand;  // -1.0 to +1.0 (joystick X axis normalized)
+    uint32_t timestamp; // For connection monitoring
+} ControlData;
+
+ControlData controlData;
+
 // ==================== TFT DISPLAY ====================
 Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+
+// ==================== ESP-NOW TRANSMITTER PEER ====================
+// Transmitter ESP32's MAC Address - REPLACE WITH YOUR TRANSMITTER MAC
+uint8_t transmitterAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // UPDATE THIS!
+esp_now_peer_info_t peerInfo;
 
 // ==================== DISPLAY VARIABLES ====================
 #define SCREEN_WIDTH 320
@@ -121,12 +137,13 @@ enum MenuScreen
     SCREEN_ACCEL,
     SCREEN_SERVO_DETAIL,
     SCREEN_DATA_LOGGER,
-    SCREEN_3D_HORIZON
+    SCREEN_3D_HORIZON,
+    SCREEN_MANUAL_MODE
 };
 
 MenuScreen currentScreen = MENU_MAIN;
 int menuSelection = 0;
-const int menuItemCount = 6;
+const int menuItemCount = 7;
 
 // Menu item names
 const char *menuItems[] = {
@@ -135,7 +152,8 @@ const char *menuItems[] = {
     "Accelerometer",
     "Servo Details",
     "Data Logger",
-    "3D Horizon"};
+    "3D Horizon",
+    "Manual Mode"};
 
 // Joystick variables
 unsigned long lastJoystickRead = 0;
@@ -384,6 +402,29 @@ void setup()
     // Register receive callback
     esp_now_register_recv_cb(OnDataRecv);
 
+    // Register transmitter as peer (for sending control data)
+    memcpy(peerInfo.peer_addr, transmitterAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK)
+    {
+        Serial.println("⚠ Warning: Failed to add transmitter peer!");
+        Serial.println("  Manual mode will not work until transmitter MAC is set.");
+    }
+    else
+    {
+        Serial.println("✓ Transmitter peer added successfully");
+        Serial.print("  Can send control data to: ");
+        for (int i = 0; i < 6; i++)
+        {
+            Serial.printf("%02X", transmitterAddress[i]);
+            if (i < 5)
+                Serial.print(":");
+        }
+        Serial.println();
+    }
+
     Serial.println("✓ ESP-NOW initialized successfully\n");
 
     Serial.println("╔════════════════════════════════════════╗");
@@ -488,12 +529,22 @@ void handleJoystickInput(JoystickDirection dir)
         // In a sub-screen
         if (dir == JS_LEFT || dir == JS_PRESSED)
         {
+            // Exit manual mode if leaving that screen
+            if (currentScreen == SCREEN_MANUAL_MODE)
+            {
+                exitManualMode();
+            }
             // Return to main menu
             currentScreen = MENU_MAIN;
             drawMainMenu();
         }
         else if (dir == JS_UP || dir == JS_DOWN)
         {
+            // Exit manual mode if leaving that screen
+            if (currentScreen == SCREEN_MANUAL_MODE)
+            {
+                exitManualMode();
+            }
             // Navigate between screens
             int screenIndex = (int)currentScreen - 1;
             if (dir == JS_UP)
@@ -536,6 +587,9 @@ void updateCurrentScreen()
     case SCREEN_3D_HORIZON:
         update3DHorizonScreen();
         break;
+    case SCREEN_MANUAL_MODE:
+        updateManualModeScreen();
+        break;
     }
 }
 
@@ -564,6 +618,9 @@ void initCurrentScreen()
         break;
     case SCREEN_3D_HORIZON:
         draw3DHorizonScreen();
+        break;
+    case SCREEN_MANUAL_MODE:
+        drawManualModeScreen();
         break;
     default:
         break;
@@ -1359,6 +1416,139 @@ void displayConnectionLost()
 
     delay(1500);
     initCurrentScreen();
+}
+
+// ---------- MANUAL MODE SCREEN ----------
+void drawManualModeScreen()
+{
+    drawScreenHeader("MANUAL MODE");
+
+    tft.setTextSize(2);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(50, 40);
+    tft.println("JOYSTICK CONTROL");
+
+    // Draw joystick indicator background
+    tft.drawRect(85, 70, 150, 120, COLOR_GRID);
+    tft.drawFastHLine(85, 130, 150, COLOR_GRID); // Center horizontal
+    tft.drawFastVLine(160, 70, 120, COLOR_GRID); // Center vertical
+
+    // Labels
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT);
+    tft.setCursor(10, 70);
+    tft.print("Pitch:");
+    tft.setCursor(250, 70);
+    tft.print("Roll:");
+
+    tft.setCursor(10, 200);
+    tft.print("Elevons:");
+
+    // Instructions
+    tft.setTextSize(1);
+    tft.setTextColor(0x7BEF);
+    tft.setCursor(30, 225);
+    tft.println("Joystick controls servos directly");
+}
+
+void updateManualModeScreen()
+{
+    // Read joystick continuously
+    int rawX = analogRead(JOYSTICK_VRX);
+    int rawY = analogRead(JOYSTICK_VRY);
+
+    // Normalize to -1.0 to +1.0 with deadzone
+    const int deadzone = 200;
+    float pitchCmd = 0.0;
+    float rollCmd = 0.0;
+
+    int deltaY = rawY - joystickCenterY;
+    int deltaX = rawX - joystickCenterX;
+
+    if (abs(deltaY) > deadzone)
+    {
+        pitchCmd = (float)deltaY / 2048.0;
+        pitchCmd = constrain(pitchCmd, -1.0, 1.0);
+    }
+
+    if (abs(deltaX) > deadzone)
+    {
+        rollCmd = (float)deltaX / 2048.0;
+        rollCmd = constrain(rollCmd, -1.0, 1.0);
+    }
+
+    // Send control data to transmitter
+    controlData.manualMode = true;
+    controlData.pitchCommand = pitchCmd;
+    controlData.rollCommand = rollCmd;
+    controlData.timestamp = millis();
+
+    esp_err_t result = esp_now_send(transmitterAddress, (uint8_t *)&controlData, sizeof(controlData));
+
+    // Update visual indicators
+    static unsigned long lastDisplayUpdate = 0;
+    if (millis() - lastDisplayUpdate > 50) // 20 FPS
+    {
+        // Clear joystick indicator area
+        tft.fillRect(86, 71, 148, 118, COLOR_BG);
+        tft.drawFastHLine(85, 130, 150, COLOR_GRID); // Center horizontal
+        tft.drawFastVLine(160, 70, 120, COLOR_GRID); // Center vertical
+
+        // Draw joystick position
+        int displayX = 160 + (int)(rollCmd * 70);
+        int displayY = 130 - (int)(pitchCmd * 55);
+        displayX = constrain(displayX, 90, 230);
+        displayY = constrain(displayY, 75, 185);
+
+        tft.fillCircle(displayX, displayY, 8, COLOR_WARN);
+        tft.drawCircle(displayX, displayY, 9, COLOR_TEXT);
+
+        // Display numeric values
+        tft.fillRect(10, 85, 70, 100, COLOR_BG);
+        tft.fillRect(250, 85, 70, 100, COLOR_BG);
+
+        tft.setTextSize(2);
+        tft.setTextColor(COLOR_TILTY);
+        tft.setCursor(10, 90);
+        tft.printf("%+.2f", pitchCmd);
+
+        tft.setTextColor(COLOR_TILTX);
+        tft.setCursor(250, 90);
+        tft.printf("%+.2f", rollCmd);
+
+        // Display servo angles (from telemetry)
+        tft.fillRect(80, 200, 230, 20, COLOR_BG);
+        tft.setTextSize(1);
+        tft.setTextColor(COLOR_SERVO1);
+        tft.setCursor(80, 200);
+        tft.printf("R: %d", (int)receivedData.servo1_actual);
+        tft.print((char)247);
+
+        tft.setTextColor(COLOR_SERVO2);
+        tft.setCursor(160, 200);
+        tft.printf("L: %d", (int)receivedData.servo2_actual);
+        tft.print((char)247);
+
+        // Connection status
+        tft.fillRect(80, 215, 150, 10, COLOR_BG);
+        tft.setTextColor(result == ESP_OK ? COLOR_GOOD : COLOR_WARN);
+        tft.setCursor(80, 215);
+        tft.print(result == ESP_OK ? "TX: OK" : "TX: FAIL");
+
+        lastDisplayUpdate = millis();
+    }
+}
+
+// Exit manual mode - send command to resume auto stabilization
+void exitManualMode()
+{
+    controlData.manualMode = false;
+    controlData.pitchCommand = 0.0;
+    controlData.rollCommand = 0.0;
+    controlData.timestamp = millis();
+
+    esp_now_send(transmitterAddress, (uint8_t *)&controlData, sizeof(controlData));
+    Serial.println("→ Exiting manual mode - transmitter resuming auto stabilization");
 }
 
 // ==================== ADDITIONAL INFO ====================
