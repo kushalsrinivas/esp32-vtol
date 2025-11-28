@@ -102,10 +102,10 @@ TelemetryData telemetry;
 // ==================== CONTROL DATA STRUCTURE (Received from Receiver) ====================
 typedef struct
 {
-    bool manualMode;      // true = manual control, false = auto stabilization
-    float pitchCommand;   // -1.0 to +1.0 (joystick Y axis normalized)
-    float rollCommand;    // -1.0 to +1.0 (joystick X axis normalized)
-    uint32_t timestamp;   // For connection monitoring
+    bool manualMode;    // true = manual control, false = auto stabilization
+    float pitchCommand; // -1.0 to +1.0 (joystick Y axis normalized)
+    float rollCommand;  // -1.0 to +1.0 (joystick X axis normalized)
+    uint32_t timestamp; // For connection monitoring
 } ControlData;
 
 ControlData receivedControl;
@@ -180,13 +180,13 @@ void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingDat
     if (len == sizeof(ControlData))
     {
         memcpy(&receivedControl, incomingData, sizeof(receivedControl));
-        
+
         // Update manual mode state
         manualModeActive = receivedControl.manualMode;
         manualPitchCmd = receivedControl.pitchCommand;
         manualRollCmd = receivedControl.rollCommand;
         lastManualCommandTime = millis();
-        
+
         // Debug output
         if (manualModeActive)
         {
@@ -474,18 +474,18 @@ void loop()
         if (manualModeActive)
         {
             // ===== MANUAL MODE: Direct joystick control (PID disabled) =====
-            
+
             // Convert joystick commands (-1.0 to +1.0) to servo angles
             // Pitch: negative command = nose up (elevons deflect together)
             // Roll: positive command = roll right (elevons deflect opposite)
-            
+
             float manual_pitch_deflection = -manualPitchCmd * ELEVON_RANGE; // Invert for correct direction
             float manual_roll_deflection = manualRollCmd * ELEVON_RANGE;
-            
+
             // Apply elevon mixing
             right_elevon_angle = ELEVON_CENTER + manual_pitch_deflection + manual_roll_deflection;
             left_elevon_angle = ELEVON_CENTER + manual_pitch_deflection - manual_roll_deflection;
-            
+
             // Reset PID integrators when in manual mode
             integral_pitch = 0;
             integral_roll = 0;
@@ -493,7 +493,7 @@ void loop()
         else
         {
             // ===== AUTO STABILIZATION MODE: PID control =====
-            
+
             // Compute PID for pitch and roll
             computePID_Pitch();
             computePID_Roll();
